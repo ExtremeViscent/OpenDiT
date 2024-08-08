@@ -8,15 +8,25 @@
 # --------------------------------------------------------
 
 import os
+from functools import partial
 from typing import Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models import AutoencoderKL, AutoencoderKLTemporalDecoder
 from einops import rearrange
 from transformers import PretrainedConfig, PreTrainedModel
+
+from opendit.core.comm import all_reduce, all_to_all_comm, gather_sequence, halo_exchange, split_sequence
+from opendit.core.parallel_mgr import (
+    enable_sequence_parallel,
+    get_sequence_parallel_group,
+    get_sequence_parallel_rank,
+    get_sequence_parallel_size,
+)
 
 from .utils import load_checkpoint
 
@@ -89,6 +99,77 @@ def exists(v):
     return v is not None
 
 
+class DistributedConv3d(nn.Conv3d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.weight_tensor = self.weight
+        self.bias_tensor = self.bias
+        self.sp = False
+
+    def forward(self, x):
+        if not enable_sequence_parallel() or not self.sp:
+            self.gt_ret = super().forward(x)
+            return self.gt_ret
+        world_size = get_sequence_parallel_size()
+        rank = get_sequence_parallel_rank()
+        rank_list = dist.get_process_group_ranks(get_sequence_parallel_group())
+        out_stride = self.out_channels // world_size
+        in_stride = self.in_channels // world_size
+        ret = None
+        for i in range(world_size):
+            weight = self.weight_tensor[
+                i * out_stride : (i + 1) * out_stride, rank * in_stride : (rank + 1) * in_stride
+            ]
+            x_ = self._conv_forward(x, weight, None)
+            dist.reduce(x_, dst=rank_list[i], group=get_sequence_parallel_group(), op=dist.ReduceOp.SUM)
+            if i == rank:
+                if self.bias is not None:
+                    x_[:, :, :, :, :] += self.bias[i * out_stride : (i + 1) * out_stride].view(1, -1, 1, 1, 1)
+                ret = x_
+        return ret
+
+
+def dist_groupnorm(
+    self, x: torch.Tensor, group_num: int, weight: torch.Tensor, bias: torch.Tensor, eps: float, group
+) -> torch.Tensor:
+    # x: input features with shape [N,C,H,W]
+    # weight, bias: scale and offset, with shape [C]
+    # group_num: number of groups for GN
+
+    x_shape = x.shape
+    batch_size = x_shape[0]
+    dtype = x.dtype
+    x = x.to(torch.float32)
+    x = x.reshape(batch_size, group_num, -1)
+
+    mean = x.mean(dim=-1, keepdim=True)
+    mean = all_reduce(mean, group)
+    mean = mean / dist.get_world_size(group)
+
+    var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
+    var = all_reduce(var, group)
+    var = var / dist.get_world_size(group)
+
+    x = (x - mean) / torch.sqrt(var + eps)
+
+    x = x.view(x_shape).to(dtype)
+    x = weight.view(1, -1, 1, 1, 1) * x + bias.view(1, -1, 1, 1, 1)
+    return x
+
+
+def _replace_groupnorm_fwd(module: nn.GroupNorm):
+    bound_method = dist_groupnorm.__get__(module, module.__class__)
+    bound_method = partial(
+        bound_method,
+        weight=module.weight,
+        bias=module.bias,
+        eps=module.eps,
+        group_num=module.num_groups,
+        group=get_sequence_parallel_group(),
+    )
+    setattr(module, "forward", bound_method)
+
+
 class CausalConv3d(nn.Module):
     def __init__(
         self,
@@ -123,6 +204,30 @@ class CausalConv3d(nn.Module):
 
     def forward(self, x):
         x = F.pad(x, self.time_causal_padding, mode=self.pad_mode)
+        x = self.conv(x)
+        return x
+
+
+class RowDistConv3d(CausalConv3d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sp = False
+
+    def forward(self, x):
+        if not self.sp:
+            return super().forward(x)
+        time_causal_padding = list(self.time_causal_padding)
+        width_pad = time_causal_padding[0]
+        if get_sequence_parallel_rank() == 0:
+            time_causal_padding[1] = 0
+        elif get_sequence_parallel_rank() == get_sequence_parallel_size() - 1:
+            time_causal_padding[0] = 0
+        else:
+            time_causal_padding[0] = 0
+            time_causal_padding[1] = 0
+        time_causal_padding = tuple(time_causal_padding)
+        x = halo_exchange(x, get_sequence_parallel_group(), 4, width_pad)
+        x = F.pad(x, time_causal_padding, mode=self.pad_mode)
         x = self.conv(x)
         return x
 
@@ -165,6 +270,14 @@ class ResBlock(nn.Module):
         if self.in_channels != self.filters:  # SCH: ResBlock X->Y
             residual = self.conv3(residual)
         return x + residual
+
+    def enable_sp(self):
+        self.conv1.sp = True
+        self.conv2.sp = True
+        _replace_groupnorm_fwd(self.norm1)
+        _replace_groupnorm_fwd(self.norm2)
+        if hasattr(self, "conv3"):
+            self.conv3.sp = True
 
 
 def get_activation_fn(activation):
@@ -298,10 +411,11 @@ class Decoder(nn.Module):
         self.num_groups = num_groups
         self.embedding_dim = latent_embed_dim
         self.s_stride = 1
+        self.sp = False
 
         self.activation_fn = get_activation_fn(activation_fn)
         self.activate = self.activation_fn()
-        self.conv_fn = CausalConv3d
+        self.conv_fn = RowDistConv3d
         self.block_args = dict(
             conv_fn=self.conv_fn,
             activation_fn=self.activation_fn,
@@ -354,6 +468,19 @@ class Decoder(nn.Module):
         self.norm1 = nn.GroupNorm(self.num_groups, prev_filters)
 
         self.conv_out = self.conv_fn(filters, in_out_channels, 3)
+
+    def enable_sp(self):
+        self.sp = True
+        self.conv1.sp = True
+        self.conv_out.sp = True
+        _replace_groupnorm_fwd(self.norm1)
+        for res_block in self.res_blocks:
+            res_block.enable_sp()
+        for res_block in self.block_res_blocks:
+            for block in res_block:
+                block.enable_sp()
+        for conv_block in self.conv_blocks:
+            conv_block.sp = True
 
     def forward(self, x):
         x = self.conv1(x)
@@ -412,7 +539,7 @@ class VAE_Temporal(nn.Module):
         )
         self.quant_conv = CausalConv3d(2 * latent_embed_dim, 2 * embed_dim, 1)
 
-        self.post_quant_conv = CausalConv3d(embed_dim, latent_embed_dim, 1)
+        self.post_quant_conv = RowDistConv3d(embed_dim, latent_embed_dim, 1)
         self.decoder = Decoder(
             in_out_channels=in_out_channels,
             latent_embed_dim=latent_embed_dim,
@@ -655,6 +782,15 @@ class VideoAutoencoderPipeline(PreTrainedModel):
         self.register_buffer("scale", scale)
         self.register_buffer("shift", shift)
 
+        self.sp = enable_sequence_parallel()
+        if self.sp:
+            # pass
+            self.enable_sp()
+
+    def enable_sp(self):
+        self.temporal_vae.decoder.enable_sp()
+        self.temporal_vae.post_quant_conv.sp = True
+
     def encode(self, x):
         x_z = self.spatial_vae.encode(x)
 
@@ -677,9 +813,27 @@ class VideoAutoencoderPipeline(PreTrainedModel):
     def decode(self, z, num_frames=None):
         if not self.cal_loss:
             z = z * self.scale.to(z.dtype) + self.shift.to(z.dtype)
-
+        if self.sp:
+            padding = (
+                get_sequence_parallel_size() - z.shape[4] % get_sequence_parallel_size()
+                if z.shape[4] % get_sequence_parallel_size() != 0
+                else 0
+            )
+            z = F.pad(z, (0, padding, 0, 0, 0, 0), value=0)
+            z = split_sequence(z, get_sequence_parallel_group(), dim=4)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
         if self.micro_frame_size is None:
             x_z = self.temporal_vae.decode(z, num_frames=num_frames)
+            if self.sp:
+                x_z = x_.narrow(4, 0, x_z.shape[4] - padding)
+                padding = (
+                    get_sequence_parallel_size() - x_z.shape[2] % get_sequence_parallel_size()
+                    if x_z.shape[2] % get_sequence_parallel_size() != 0
+                    else 0
+                )
+                x_z = F.pad(x_z, (0, 0, 0, 0, 0, padding), value=1e-6)
+                x_z = all_to_all_comm(x_z, get_sequence_parallel_group(), scatter_dim=2, gather_dim=4)
             x = self.spatial_vae.decode(x_z)
         else:
             x_z_list = []
@@ -689,7 +843,20 @@ class VideoAutoencoderPipeline(PreTrainedModel):
                 x_z_list.append(x_z_bs)
                 num_frames -= self.micro_frame_size
             x_z = torch.cat(x_z_list, dim=2)
+            if self.sp:
+                x_z = x_z.narrow(4, 0, x_z.shape[4] - padding)
+                padding = (
+                    get_sequence_parallel_size() - x_z.shape[2] % get_sequence_parallel_size()
+                    if x_z.shape[2] % get_sequence_parallel_size() != 0
+                    else 0
+                )
+                x_z = F.pad(x_z, (0, 0, 0, 0, 0, padding), value=1e-6)
+                x_z = all_to_all_comm(x_z, get_sequence_parallel_group(), scatter_dim=2, gather_dim=4)
             x = self.spatial_vae.decode(x_z)
+        print(torch.cuda.max_memory_allocated())
+        if self.sp:
+            x = gather_sequence(x, get_sequence_parallel_group(), dim=2)
+            x = x.narrow(2, 0, x.shape[2] - padding)
 
         if self.cal_loss:
             return x, x_z

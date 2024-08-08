@@ -31,6 +31,9 @@ def set_parallel_manager(world_size, dp_axis=0, sp_axis=1, enable_cp=True):
         else:
             dp_size = 2
             sp_size = world_size // 2
+    else:
+        dp_size = 1
+        sp_size = world_size
     PARALLEL_MANAGER = ParallelManager(dp_size, sp_size, dp_axis, sp_axis)
 
 
